@@ -3205,6 +3205,29 @@
         const building = buildings.get(id);
         return building ? { ...building, facade: [...(building.facade ?? defaultFacade)] } : null;
       };
+      this.focusBuilding = id => {
+        if (!editor.hidden || !width || !height || !scale) return false;
+        const building=buildings.get(id);
+        const plot=plotsByBuilding.get(id);
+        if (!building || !plot || !visibleObject(plot)) return false;
+        stopKeyboardPan();
+        clearZoomPreview();
+        gesture=undefined;
+        overview=false;
+        const {x,y,width:w,depth:d,height:h}=building;
+        const top=h+(roofHeights[building.top] ?? 32);
+        const fit=Math.min((width-60)/(w+d+20),(height-100)/((w+d)*.49+top+30));
+        if (fit>0 && scale>fit) {
+          scale=fit;
+          zoom=scale/Math.min(1.55,Math.max(.65,width/710));
+        }
+        camera.x=x+w/2-y-d/2;
+        camera.y=(x+w/2+y+d/2)*.49-top/2;
+        zoomIn.disabled=zoom>=maxZoom;
+        zoomOut.disabled=zoom<=minZoom;
+        draw();
+        return true;
+      };
       this.updateBuilding = (id, changes) => {
         const building = buildings.get(id);
         if (!building) return false;

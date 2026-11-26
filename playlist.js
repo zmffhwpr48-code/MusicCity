@@ -316,6 +316,7 @@
     if (!track) return;
     selectedTrackId = id;
     renderTracks();
+    if (track.buildingId) map.focusBuilding?.(track.buildingId);
 
     if (!track.hasAudio) {
       unloadAudio();
@@ -567,8 +568,12 @@
       const item = event.target.closest(".track-item");
       if (!item) return;
       if (event.target.closest(".track-delete")) void deleteTrack(item.dataset.id);
-      else if (event.target.closest(".track-main") && audio.dataset.trackId !== item.dataset.id) {
-        void playTrack(item.dataset.id, false);
+      else if (event.target.closest(".track-main")) {
+        if (audio.dataset.trackId !== item.dataset.id) void playTrack(item.dataset.id, false);
+        else {
+          const track=tracks.find(track=>track.id===item.dataset.id);
+          if (track?.buildingId) map.focusBuilding?.(track.buildingId);
+        }
       }
     });
     playButton.addEventListener("click", () => {

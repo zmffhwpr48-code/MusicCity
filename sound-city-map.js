@@ -30,7 +30,6 @@
           <summary>배경 요소</summary>
           <div class="effects-buttons">
             <button type="button" data-effect="boat" aria-pressed="true">배 켜짐</button>
-            <button type="button" data-effect="bridge" aria-pressed="true">다리 개폐 켜짐</button>
             <button type="button" data-effect="cars" aria-pressed="true">자동차 켜짐</button>
             <button type="button" data-effect="plane" aria-pressed="true">비행기 켜짐</button>
           </div>
@@ -184,14 +183,14 @@
       }
       let shadowsNeedPaint=true;
       const effectStorageKey="sound-city-effects-v1";
-      const effects={boat:true,bridge:true,cars:true,plane:true};
+      const effects={boat:true,cars:true,plane:true};
       try {
         const storedEffects=JSON.parse(localStorage.getItem(effectStorageKey));
         for (const name of Object.keys(effects)) {
           if (typeof storedEffects?.[name]==="boolean") effects[name]=storedEffects[name];
         }
       } catch {}
-      const effectNames={boat:"배",bridge:"다리 개폐",cars:"자동차",plane:"비행기"};
+      const effectNames={boat:"배",cars:"자동차",plane:"비행기"};
       const effectButtons=[...root.querySelectorAll("[data-effect]")];
       const effectsPanel=root.querySelector(".effects-panel");
       this.closeEffectsOutside=event=> {
@@ -211,11 +210,12 @@
         button.addEventListener("click",()=> {
           const name=button.dataset.effect;
           effects[name]=!effects[name];
+          if (name==="boat") invalidateWorldPreview();
           refreshEffectButtons();
           const feedback=root.querySelector(".effects-feedback");
           try {
             localStorage.setItem(effectStorageKey,JSON.stringify(effects));
-            feedback.textContent=name==="bridge" && !effects.bridge ? "다리는 닫힌 상태로 유지돼요" : "";
+            feedback.textContent="";
           } catch {
             feedback.textContent="현재 화면에 적용됨 · 브라우저 저장 불가";
           }
@@ -910,11 +910,12 @@
       }
       const riverCrossings = [-400,0,400];
       function bridgeOpening(boatX, bridgeX) {
-        if (!effects.bridge) return 0;
+        if (!effects.boat) return 0;
         const amount = Math.max(0,Math.min(1,(88-Math.abs(boatX-bridgeX))/52));
         return amount*amount*(3-2*amount);
       }
       function drawRiverTraffic(now) {
+        if (!effects.boat) return Infinity;
         const elapsed = (now-firstTrafficFrame)/1000;
         const columns = [...open.values()].filter(tile => tile.row===0 && isCity(tile)).map(tile => tile.col);
         const left = Math.min(...columns)*blockSize-690;
@@ -1720,7 +1721,7 @@
         const connections = isCity(tile) ? {} : landscapeConnections(tile);
         const connectionKey=Object.values(connections).map(Number).join("");
         const imageKey = tile.type==="reservoir" ? "reservoir7-"+tile.row+"-"+connectionKey :
-          tile.type==="park" ? "park-"+connectionKey : river;
+          tile.type==="park" ? "park-"+connectionKey : river ? "city-river-"+effects.boat : false;
         let image = districtImages.get(imageKey);
         if (!image) {
           image = document.createElement("canvas");
@@ -1822,6 +1823,22 @@
           }
         }
       }
+      function drawClosedRiverBridges() {
+        for (const x of riverCrossings) {
+          box(x-13,waterTop,26,waterBottom-waterTop,6,
+            ["#242c40","#59647f","#414b63"],-6);
+          for (const rail of [x-12,x+12]) {
+            box(rail-.6,waterTop,1.2,waterBottom-waterTop,2,
+              ["#9ba6bc","#747f96","#747f96"],3);
+            for (let y=waterTop+6;y<waterBottom;y+=22) {
+              box(rail-.6,y,1.2,1.2,4,["#9ba6bc","#747f96","#747f96"]);
+            }
+          }
+          for (let y=waterTop+7;y<waterBottom;y+=22) {
+            plane(x-.55,y,1.1,Math.min(10,waterBottom-y),"#8e8390");
+          }
+        }
+      }
       function drawDistrict(tile) {
         if (!intersectsView(-620,-620,1440,1440,0,24)) return;
         if (tile.type==="park") {
@@ -1871,6 +1888,7 @@
           }
           plane(start,y,800-start,5,'#74788d');
         }
+        if (!effects.boat) drawClosedRiverBridges();
       }
       function drawSwapHighlights() {
         ctx.save();
@@ -2838,17 +2856,50 @@
         }));
       }
 
+      const buildingHitRegions=new WeakMap();
+      function hitRegions(design) {
+        const faces=buildingOcclusion(design);
+        let regions=buildingHitRegions.get(faces);
+        if(regions)return regions;
+        regions=faces.map(face=>{
+          const points=face.map(([x,y,z])=>[x-y,(x+y)*.49-z]);
+          const xs=points.map(p=>p[0]),ys=points.map(p=>p[1]);
+          return {points,left:Math.min(...xs),right:Math.max(...xs),top:Math.min(...ys),bottom:Math.max(...ys)};
+        });
+        buildingHitRegions.set(faces,regions);
+        return regions;
+      }
+      function pointInBuildingFace(x,y,face) {
+        if(x<face.left || x>face.right || y<face.top || y>face.bottom)return false;
+        let inside=false;
+        const points=face.points;
+        for(let i=0,j=points.length-1;i<points.length;j=i++) {
+          const [ax,ay]=points[i],[bx,by]=points[j];
+          const cross=(bx-ax)*(y-ay)-(by-ay)*(x-ax);
+          if(Math.abs(cross)<1e-7 && x>=Math.min(ax,bx) && x<=Math.max(ax,bx) &&
+            y>=Math.min(ay,by) && y<=Math.max(ay,by))return true;
+          if((ay>y)!==(by>y) && x<(bx-ax)*(y-ay)/(by-ay)+ax)inside=!inside;
+        }
+        return inside;
+      }
       function findBuilding(event) {
-        const bounds = canvas.getBoundingClientRect();
-        const px = event.clientX-bounds.left;
-        const py = event.clientY-bounds.top;
-        return viewObjects().findLast(({building:b,district:objectsDistrict}) => {
-          if (!b || !visibleObject({building:b,district:objectsDistrict})) return false;
-          const [left] = project(b.x,b.y+b.depth);
-          const [right] = project(b.x+b.width,b.y);
-          const [,top] = project(b.x,b.y,b.height);
-          const [,bottom] = project(b.x+b.width,b.y+b.depth);
-          return px>=left && px<=right && py>=top && py<=bottom;
+        const bounds=canvas.getBoundingClientRect();
+        const px=event.clientX-bounds.left,py=event.clientY-bounds.top;
+        return viewObjects().findLast(object=>{
+          const b=object.building;
+          if(!b || !visibleObject(object))return false;
+          const design=b===selected && !editor.hidden?{...b,...readDesign()}:b;
+          if(b.trackId) {
+            const [cx,roofY]=project(b.x+b.width/2,b.y+b.depth/2,
+              design.height+(roofHeights[design.top]??0));
+            if(Math.hypot(px-cx,py-(roofY-15))<=11)return true;
+          }
+          const [originX,originY]=project(b.x,b.y);
+          const x=(px-originX)/scale,y=(py-originY)/scale;
+          // A broad check is cheap. Only painted building faces decide the actual hit.
+          if(x<-b.depth-45 || x>b.width+45 || y<-design.height-130 ||
+            y>(b.width+b.depth)*.49+35)return false;
+          return hitRegions(design).some(face=>pointInBuildingFace(x,y,face));
         })?.building;
       }
       function closeBuildingEditor() {

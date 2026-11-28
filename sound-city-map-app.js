@@ -25,6 +25,7 @@
         <canvas class="traffic" aria-hidden="true" style="pointer-events:none"></canvas>
         <canvas class="merge-selection-layer" aria-hidden="true" style="pointer-events:none"></canvas>
         <div class="daylight-tint" aria-hidden="true"></div>
+        <canvas class="music-badges" aria-hidden="true" style="pointer-events:none"></canvas>
         <div class="scene-controls">
         <details class="effects-panel">
           <summary>배경 요소</summary>
@@ -99,7 +100,7 @@
           <label>옥상 형태 <select name="top">
             <option value="flat">평지붕</option><option value="gable">박공지붕</option>
             <option value="steps">계단형</option><option value="garden">정원</option>
-            <option value="antenna">안테나</option><option value="greenhouse">온실형</option><option value="billboard">광고판형</option><option value="tank">물탱크형</option><option value="dome">돔형</option><option value="industrial">산업형</option><option value="pergola">파고라형</option>
+            <option value="antenna">안테나</option><option value="greenhouse">온실형</option><option value="billboard">광고판형</option><option value="tank" hidden disabled>물탱크형 (기존 디자인)</option><option value="dome">돔형</option><option value="industrial">산업형</option><option value="pergola">파고라형</option>
           </select></label>
           <label>창문 패턴 <select name="windows">
             <option value="grid">격자형</option><option value="wide">가로형</option>
@@ -140,10 +141,12 @@
       const shadowContext=shadowCanvas.getContext("2d");
       const structureCanvas=root.querySelector(".scene-structures");
       const structureContext=structureCanvas.getContext("2d");
+      const musicCanvas=root.querySelector(".music-badges");
+      const musicContext=musicCanvas.getContext("2d");
       const mergeCanvas=root.querySelector(".merge-selection-layer");
       const mergeContext=mergeCanvas.getContext("2d");
       // Keep the base canvas as the input surface even with an older cached stylesheet.
-      for (const layer of [shadowCanvas,structureCanvas,trafficCanvas,
+      for (const layer of [shadowCanvas,structureCanvas,trafficCanvas,musicCanvas,
           root.querySelector(".scene-sky"),root.querySelector(".daylight-tint")]) {
         layer.style.pointerEvents="none";
       }
@@ -451,6 +454,7 @@
       function placeBuilding(plot, building) {
         plot.building = building;
         if (!building) return;
+        building.buildingType=parts.normalize(building).buildingType;
         building.width = plotWidth(plot);
         building.depth = plotDepth(plot);
         building.x = plot.x - building.width;
@@ -834,7 +838,7 @@
           if (building) {
             const design = building === selected && !editor.hidden ? {...building,...readDesign()} : building;
             const {x,y} = building;
-            const model = buildingModel(design);
+            const model = design;
             if (!intersectsView(model.x,model.y,model.width,model.depth,model.height+80,32)) continue;
             for(const face of buildingOcclusion(design)) {
               add(object,face.map(([px,py,pz])=>[x+px,y+py,pz]));
@@ -1285,16 +1289,13 @@
         invalidateWorldPreview();
         draw();
       };
-      function buildingModel(building) {
-        return window.SoundCityLandmarks?.modelBounds(building) ?? building;
-      }
       function drawMusicBadge(building) {
-        building = buildingModel(building);
         if (building.cachedSprite) return;
         const badgeColor = building.trackId === selectedMusicTrackId ? "#60b8ff" : "#ffcc70";
-        const {x,y,width,depth,height,top} = building;
-        const [cx,roofY] = project(x+width/2,y+depth/2,height+(roofHeights[top] ?? 0));
+        const {x,y,width:w,depth:d,height:h,top} = building;
+        const [cx,roofY] = project(x+w/2,y+d/2,h+(roofHeights[top] ?? 0));
         const cy = roofY-15;
+        if (cx < -16 || cx > width+16 || cy < -16 || cy > height+16) return;
         ctx.save();
         ctx.fillStyle = "#141b2d";
         ctx.strokeStyle = badgeColor;
@@ -1313,6 +1314,21 @@
         ctx.textBaseline = "middle";
         ctx.fillText("♪",cx,cy);
         ctx.restore();
+      }
+      function paintMusicBadges() {
+        musicContext.clearRect(0,0,width,height);
+        const previousContext=ctx;
+        try {
+          ctx=musicContext;
+          for (const object of viewObjects()) {
+            const building=object.building;
+            if (!building?.trackId || !visibleObject(object)) continue;
+            const design=building===selected && !editor.hidden ? {...building,...readDesign()} : building;
+            drawMusicBadge(design);
+          }
+        } finally {
+          ctx=previousContext;
+        }
       }
       const buildingSprites = new Map();
       let buildingSpritePixels = 0;
@@ -1378,33 +1394,24 @@
       function drawBuilding(b) {
         if(b.thumbnail && !b.cachedSprite)drawBuildingFootprint(b);
         if (b === selected && !editor.hidden) b = { ...b, ...readDesign(), preview:true };
-        if (window.SoundCityLandmarks?.draw(b,{box,polygon})) {
-          if (b.trackId) drawMusicBadge(b);
-          return;
-        }
         if (scale < .28 && !b.thumbnail && !b.cachedSprite) {
           drawDistantBuilding(b);
-          if(b.trackId)drawMusicBadge(b);
           return;
         }
         if (["firestation","police","hospital"].includes(b.buildingType)) {
           parts.drawCivic(b,{box,plane,polygon,project,ctx,scale});
-          if (b.trackId) drawMusicBadge(b);
           return;
         }
         if (b.buildingType === "artdeco") {
           parts.drawArtDeco(b,{box,plane,polygon,project,ctx,scale});
-          if (b.trackId) drawMusicBadge(b);
           return;
         }
         if (b.buildingType === "japanese") {
           parts.drawJapanese(b,{box,plane,polygon,project,ctx,scale});
-          if (b.trackId) drawMusicBadge(b);
           return;
         }
         if (b.buildingType === "factory") {
           parts.drawFactory(b,{box,plane,polygon,project,ctx,scale});
-          if (b.trackId) drawMusicBadge(b);
           return;
         }
         const originalBuilding = b;
@@ -1442,7 +1449,6 @@
 
         parts.drawCharacter(originalBuilding,{box,plane,polygon,project,ctx,scale});
         parts.drawArchitecture(originalBuilding,{box,plane,polygon,project,ctx,scale});
-        if (b.trackId) drawMusicBadge(b);
       }
       const editorSections = [];
       function createEditorSection(label, control) {
@@ -1469,9 +1475,7 @@
         section.append(group);
         select.parentElement.hidden = true;
         select.hidden = true;
-        const landmarkGroup = name === "buildingType"
-          ? window.SoundCityLandmarks?.addChoices(select, group) : null;
-        const cards = [...select.options].filter(option => option.value).map(option => {
+        const cards = [...select.options].filter(option => option.value && !option.hidden && !option.disabled).map(option => {
           const button = document.createElement("button");
           button.type = "button";
           const image = document.createElement("canvas");
@@ -1479,7 +1483,7 @@
           image.height = 100;
           image.setAttribute("aria-hidden", "true");
           button.append(image, option.textContent);
-          (option.parentElement.tagName === "OPTGROUP" && landmarkGroup ? landmarkGroup : group).append(button);
+          group.append(button);
           button.addEventListener("click", () => {
             select.value = option.value;
             select.dispatchEvent(new Event("input", { bubbles:true }));
@@ -1638,6 +1642,7 @@
         liveHeightScene.dynamicGrid=buildOcclusionGrid(null,selected);
         shadowsNeedPaint=true;
         paintShadows();
+        paintMusicBadges();
       }
       function scheduleLiveHeightPreview() {
         if(heightPreviewFrame===undefined)heightPreviewFrame=requestAnimationFrame(paintLiveHeightPreview);
@@ -1658,6 +1663,7 @@
         occlusionGrid = undefined;
         clearTimeout(colorPreviewTimer);
         renderMap();
+        paintMusicBadges();
         queueWorldPreview();
         if(selected && !editor.hidden) {
           const building=selected,view=heightSceneView();
@@ -1975,7 +1981,7 @@
           if (object.building) {
             const b=object.building;
             const design=b===selected && !editor.hidden ? {...b,...readDesign()} : b;
-            ({x,y,width:w,depth:d,height:h}=buildingModel(design));
+            ({x,y,width:w,depth:d,height:h}=design);
             if (design.buildingType==="factory") h*=1.5;
           } else if (object.tree) {
             x=object.x-object.size*.65; y=object.y-object.size*.65;
@@ -2055,7 +2061,7 @@
           const [originX,originY]=project(0,0);
           let left=Infinity,right=-Infinity,top=Infinity,bottom=-Infinity;
           for(const o of list) {
-            const b=o.building ? buildingModel(o.building) : null;
+            const b=o.building ? o.building : null;
             const x=b?.x??o.x,y=b?.y??o.y;
             const w=b?.width??0,d=b?.depth??0,h=b?b.height+110:60;
             const points=[[x-35,y+d+35,0],[x+w+35,y-35,0],[x-35,y-35,h],[x+w+35,y+d+35,0]];
@@ -2096,7 +2102,7 @@
           if (!visibleObject(o)) continue;
           if (o.building) {
             const b = o.building;
-            const model=buildingModel(b===selected && !editor.hidden ? {...b,...readDesign()} : b);
+            const model=(b===selected && !editor.hidden ? {...b,...readDesign()} : b);
             if (intersectsView(model.x-5,model.y-5,model.width+10,model.depth+10,
               model.height+46)) drawBuilding(b);
           } else if (o.plotId) {
@@ -2141,11 +2147,12 @@
         canvas.height = Math.round(height*ratio);
         trafficCanvas.width = canvas.width;
         trafficCanvas.height = canvas.height;
-        shadowCanvas.width=structureCanvas.width=mergeCanvas.width=canvas.width;
-        shadowCanvas.height=structureCanvas.height=mergeCanvas.height=canvas.height;
+        shadowCanvas.width=structureCanvas.width=mergeCanvas.width=musicCanvas.width=canvas.width;
+        shadowCanvas.height=structureCanvas.height=mergeCanvas.height=musicCanvas.height=canvas.height;
         mergeContext.setTransform(ratio,0,0,ratio,0,0);
         shadowContext.setTransform(ratio,0,0,ratio,0,0);
         structureContext.setTransform(ratio,0,0,ratio,0,0);
+        musicContext.setTransform(ratio,0,0,ratio,0,0);
         shadowsNeedPaint=true;
         ctx.setTransform(ratio,0,0,ratio,0,0);
         const baseScale = Math.min(1.55,Math.max(.65,width/710));
@@ -2303,6 +2310,7 @@
           if(target===canvas)drawWorldPreview(context);
           context.drawImage(image,left,top,zoomPreview.width*factor,zoomPreview.height*factor);
         }
+        paintMusicBadges();
         drawMergeSelection();
       }
       function settleZoom() {
@@ -2457,7 +2465,7 @@
         if (!selected || !scale || editor.hidden) return;
         const bounds = canvas.getBoundingClientRect();
         const panel = editor.getBoundingClientRect();
-        const design = buildingModel({...selected,...readDesign()});
+        const design = {...selected,...readDesign()};
         const {x,y,width:w,depth:d} = design;
         const roofHeight = (roofHeights[design.top] ?? 32);
         const worldWidth = w+d+20;
@@ -2915,7 +2923,7 @@
           const b=object.building;
           if(!b || !visibleObject(object))return false;
           const design=b===selected && !editor.hidden?{...b,...readDesign()}:b;
-          const model=buildingModel(design);
+          const model=design;
           if(b.trackId) {
             const [cx,roofY]=project(model.x+model.width/2,model.y+model.depth/2,
               model.height+(roofHeights[model.top]??0));
@@ -3290,7 +3298,7 @@
         clearZoomPreview();
         gesture=undefined;
         overview=false;
-        const {x,y,width:w,depth:d,height:h,top:roof}=buildingModel(building);
+        const {x,y,width:w,depth:d,height:h,top:roof}=building;
         const top=h+(roofHeights[roof] ?? 32);
         const fit=Math.min((width-60)/(w+d+20),(height-100)/((w+d)*.49+top+30));
         if (fit>0 && scale>fit) {

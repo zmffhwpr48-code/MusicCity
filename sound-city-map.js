@@ -146,6 +146,13 @@
         </form>
         <output>드래그 · 방향키로 이동 / 휠로 확대·축소</output>`;
       const canvas = root.querySelector('canvas');
+      const presentationContext=canvas.getContext("2d");
+      const groundCanvas=document.createElement("canvas");
+      const groundContext2D=groundCanvas.getContext("2d");
+      let frameDirty=true,sceneViewKey="",presentedView=null;
+      let displayPixelRatio=1;
+      let sharedProjection;
+
       const trafficCanvas = root.querySelector(".traffic");
       const trafficContext = trafficCanvas.getContext("2d");
       const shadowCanvas=root.querySelector(".scene-shadows");
@@ -154,6 +161,9 @@
       const structureContext=structureCanvas.getContext("2d");
       const mergeCanvas=root.querySelector(".merge-selection-layer");
       const mergeContext=mergeCanvas.getContext("2d");
+      const screenContexts=new Set([groundContext2D,shadowContext,structureContext,trafficContext,mergeContext]);
+      // Only the presentation canvas is displayed, keeping map and transport pixels atomic.
+      for (const layer of [shadowCanvas,structureCanvas,trafficCanvas]) layer.style.display="none";
       // Keep the base canvas as the input surface even with an older cached stylesheet.
       for (const layer of [shadowCanvas,structureCanvas,trafficCanvas,
           root.querySelector(".scene-sky"),root.querySelector(".daylight-tint")]) {
@@ -411,7 +421,7 @@
       let minZoom;
       let overview = true;
       const maxZoom = 2.5;
-      let ctx = canvas.getContext('2d');
+      let ctx = groundContext2D;
 
       const camera = { x: 0, y: 110 };
       let seed = 74;
@@ -724,10 +734,31 @@
       let offsetX = 0;
       let offsetY = 0;
       let width, height, scale, selected, hovered, gesture, selectedPlot, swapSource, dropPlot;
-      const project = (x,y,z=0) => [
-        width/2+(x+offsetX-y-offsetY-camera.x)*scale,
-        height/2+((x+y+offsetX+offsetY)*0.49-z-camera.y)*scale
-      ];
+      function displayPixel(value) {
+        return Math.round(value*displayPixelRatio)/displayPixelRatio;
+      }
+      function screenOrigin() {
+        if (!sharedProjection || sharedProjection.width!==width || sharedProjection.height!==height ||
+            sharedProjection.scale!==scale || sharedProjection.x!==camera.x || sharedProjection.y!==camera.y ||
+            sharedProjection.ratio!==displayPixelRatio) {
+          sharedProjection={
+            width,height,scale,x:camera.x,y:camera.y,ratio:displayPixelRatio,
+            originX:displayPixel(width/2-camera.x*scale),
+            originY:displayPixel(height/2-camera.y*scale)
+          };
+        }
+        return sharedProjection;
+      }
+      const project = (x,y,z=0) => {
+        if (screenContexts.has(ctx)) {
+          const {originX,originY}=screenOrigin();
+          return [originX+(x+offsetX-y-offsetY)*scale,
+            originY+((x+y+offsetX+offsetY)*.49-z)*scale];
+        }
+        // Asset generation keeps its own local projection without viewport rounding.
+        return [width/2+(x+offsetX-y-offsetY-camera.x)*scale,
+          height/2+((x+y+offsetX+offsetY)*.49-z-camera.y)*scale];
+      };
       const trafficByDistrict = new Map();
       const trafficRoads = roads.slice(1,-1);
       const trafficDirections = [[200,0],[-200,0],[0,200],[0,-200]];
@@ -831,11 +862,17 @@
       }
 
       const occlusionCellSize = 96;
-      let occlusionGrid, occlusionView;
-      function buildOcclusionGrid(skipBuilding=null,onlyBuilding=null) {
+      let occlusionGrid, occlusionView, occlusionAnchor;
+      function buildOcclusionGrid(skipBuilding=null,onlyBuilding=null,padding=0) {
         const grid = new Map();
         function add(object, points, lamp=false, radius=0) {
           const outline = points.map(point => project(...point));
+          let area=0;
+          for (let index=0;index<outline.length;index++) {
+            const a=outline[index],b=outline[(index+1)%outline.length];
+            area+=a[0]*b[1]-b[0]*a[1];
+          }
+          if (area<0) outline.reverse();
           const xs = outline.map(([x]) => x);
           const ys = outline.map(([,y]) => y);
           const left = Math.min(...xs)-radius, right = Math.max(...xs)+radius;
@@ -849,7 +886,7 @@
             }
           }
         }
-        const candidates=onlyBuilding?[plotsByBuilding.get(onlyBuilding.id)].filter(Boolean):viewObjects();
+        const candidates=onlyBuilding?[plotsByBuilding.get(onlyBuilding.id)].filter(Boolean):padding ? objects : viewObjects();
         for (const object of candidates) {
           if (!visibleObject(object)) continue;
           const building = object.building;
@@ -858,13 +895,13 @@
             const design = building === selected && !editor.hidden ? {...building,...readDesign()} : building;
             const {x,y,width:w,depth:d} = building;
             const h = design.height;
-            if (!intersectsView(x,y,w,d,h+80,32)) continue;
+            if (!intersectsView(x,y,w,d,h+80,32+padding)) continue;
             for(const face of buildingOcclusion(design)) {
               add(object,face.map(([px,py,pz])=>[x+px,y+py,pz]));
             }
           } else if (object.lamp) {
             const {x,y} = object;
-            if (!intersectsView(x,y,2,2,20,32)) continue;
+            if (!intersectsView(x,y,2,2,20,32+padding)) continue;
             add(object,[[x,y+1.6,17],[x,y,17],[x+1.6,y,17],
               [x+1.6,y,0],[x+1.6,y+1.6,0],[x,y+1.6,0]],true);
             add(object,[[x,y,18]],true,2.4*scale);
@@ -872,16 +909,31 @@
         }
         return grid;
       }
-      function clipForeground(depth,left,top,right,bottom,includeLamps=false) {
+      function foregroundMasks(depth,left,top,right,bottom,includeLamps=false) {
         const view = [width,height,scale,camera.x,camera.y].join(",");
         const liveScene=heightPreviewPending && liveHeightScene && liveHeightScene.building===selected && liveHeightScene.view===view ? liveHeightScene:null;
+        let shiftX=0,shiftY=0;
         if(liveScene) {
           occlusionGrid=liveScene.staticGrid;
           occlusionView=view;
-        } else if (!occlusionGrid || view !== occlusionView) {
-          occlusionGrid = buildOcclusionGrid();
-          occlusionView = view;
+          occlusionAnchor=undefined;
+        } else {
+          const reusable=occlusionGrid && occlusionAnchor &&
+            occlusionAnchor.scale===scale && occlusionAnchor.width===width && occlusionAnchor.height===height &&
+            Math.abs(occlusionAnchor.x-camera.x)*scale<224 &&
+            Math.abs(occlusionAnchor.y-camera.y)*scale<224;
+          if (!reusable) {
+            occlusionGrid=buildOcclusionGrid(null,null,288);
+            const origin=screenOrigin();
+            occlusionAnchor={x:camera.x,y:camera.y,scale,width,height,
+              originX:origin.originX,originY:origin.originY};
+            occlusionView=view;
+          }
+          const origin=screenOrigin();
+          shiftX=origin.originX-occlusionAnchor.originX;
+          shiftY=origin.originY-occlusionAnchor.originY;
         }
+        left-=shiftX;right-=shiftX;top-=shiftY;bottom-=shiftY;
         const candidates = new Set();
         for (let col=Math.floor(left/occlusionCellSize); col<=Math.floor(right/occlusionCellSize); col++) {
           for (let row=Math.floor(top/occlusionCellSize); row<=Math.floor(bottom/occlusionCellSize); row++) {
@@ -892,20 +944,71 @@
             if(dynamicCell)for(const shape of dynamicCell)candidates.add(shape);
           }
         }
+        const masks=[];
         for (const shape of candidates) {
           if (shape.depth<=depth || (!includeLamps && shape.lamp) ||
               right<shape.left || left>shape.right || bottom<shape.top || top>shape.bottom) continue;
-          ctx.beginPath();
-          ctx.rect(0,0,width,height);
-          if (shape.radius) {
-            const [[x,y]] = shape.outline;
-            ctx.moveTo(x+shape.radius,y);
-            ctx.arc(x,y,shape.radius,0,2*Math.PI);
-          } else {
-            shape.outline.forEach(([x,y],index) => index ? ctx.lineTo(x,y) : ctx.moveTo(x,y));
+          masks.push(shape);
+        }
+        return {masks,shiftX,shiftY};
+      }
+      const transportBuffer=document.createElement("canvas");
+      const transportContext=transportBuffer.getContext("2d");
+      screenContexts.add(transportContext);
+      function drawOccluded(depth,left,top,right,bottom,includeLamps,paint) {
+        const {masks,shiftX,shiftY}=foregroundMasks(depth,left,top,right,bottom,includeLamps);
+        if (!masks.length) {
+          paint();
+          return;
+        }
+        const ratio=displayPixelRatio;
+        const px=Math.max(0,Math.floor(left*ratio)-2);
+        const py=Math.max(0,Math.floor(top*ratio)-2);
+        const endX=Math.min(trafficCanvas.width,Math.ceil(right*ratio)+2);
+        const endY=Math.min(trafficCanvas.height,Math.ceil(bottom*ratio)+2);
+        const w=endX-px,h=endY-py;
+        if (w<=0 || h<=0) return;
+        if (transportBuffer.width<w || transportBuffer.height<h) {
+          transportBuffer.width=Math.max(transportBuffer.width,Math.ceil(w/64)*64);
+          transportBuffer.height=Math.max(transportBuffer.height,Math.ceil(h/64)*64);
+        }
+        transportContext.setTransform(1,0,0,1,0,0);
+        transportContext.globalCompositeOperation="source-over";
+        transportContext.clearRect(0,0,w,h);
+        transportContext.save();
+        transportContext.beginPath();
+        transportContext.rect(0,0,w,h);
+        transportContext.clip();
+        try {
+          transportContext.setTransform(ratio,0,0,ratio,-px,-py);
+          const target=ctx;
+          try {
+            ctx=transportContext;
+            paint();
+          } finally {
+            ctx=target;
           }
-          ctx.closePath();
-          ctx.clip("evenodd");
+          // Subtract the union of foreground faces in one pass, instead of clipping each face.
+          transportContext.globalCompositeOperation="destination-out";
+          transportContext.beginPath();
+          for (const shape of masks) {
+            if (shape.radius) {
+              const [[x,y]]=shape.outline;
+              transportContext.moveTo(x+shiftX+shape.radius,y+shiftY);
+              transportContext.arc(x+shiftX,y+shiftY,shape.radius,0,2*Math.PI);
+            } else {
+              shape.outline.forEach(([x,y],index)=>index ?
+                transportContext.lineTo(x+shiftX,y+shiftY) :
+                transportContext.moveTo(x+shiftX,y+shiftY));
+            }
+            transportContext.closePath();
+          }
+          transportContext.fillStyle="#000";
+          transportContext.fill();
+          transportContext.globalCompositeOperation="source-over";
+          target.drawImage(transportBuffer,0,0,w,h,px/ratio,py/ratio,w/ratio,h/ratio);
+        } finally {
+          transportContext.restore();
         }
       }
       const riverCrossings = [-400,0,400];
@@ -937,9 +1040,7 @@
             const [right]=project(boatX+46,riverY-11);
             const [,top]=project(boatX-46,riverY-11,16);
             const [,bottom]=project(boatX+46,riverY+11,-1);
-            ctx.save();
-            try {
-              clipForeground(boatX+riverY,left,top,right,bottom,true);
+            drawOccluded(boatX+riverY,left,top,right,bottom,true,()=> {
               const stern = boatX-direction*25;
               const shoulder = boatX+direction*13;
               const bow = boatX+direction*27;
@@ -970,9 +1071,7 @@
               plane(boatX-11,riverY-6,19,12,"#eee0bd",15);
               polygon([[boatX-7,riverY+5,9],[boatX+4,riverY+5,9],
                 [boatX+4,riverY+5,12],[boatX-7,riverY+5,12]],"#7999a6");
-            } finally {
-              ctx.restore();
-            }
+            });
           }
           for (const crossing of riverCrossings) {
             const x = startX+crossing;
@@ -999,8 +1098,7 @@
               const [,top] = project(x-14,Math.min(hinge,tip)-7,elevation+8);
               const [,bottom] = project(x+14,Math.max(hinge,tip)+7,-6);
               if (right < 0 || left > width || bottom < 0 || top > height) continue;
-              ctx.save();
-              clipForeground(x+Math.max(hinge,tip),left,top,right,bottom);
+              drawOccluded(x+Math.max(hinge,tip),left,top,right,bottom,false,()=> {
               const thickness = 6;
               const deck = (edge, fraction) => railPoint(edge,fraction,0);
               // Both hinge edges stay at the riverbank, below the adjoining road.
@@ -1024,7 +1122,7 @@
                 polygon([deck(x-.55,0),deck(x+.55,0),deck(x+.55,1),deck(x-.55,1)],"#8e8390");
                 drawRail(x+12);
               }
-              ctx.restore();
+              });
             }
           }
         }
@@ -1095,15 +1193,24 @@
         root.trafficFrame = requestAnimationFrame(animateTraffic);
         advanceTime(now);
         if (!width || !height || !scale) return;
-        // All four layers, including vehicles, stay visible during the zoom preview.
-        if(zoomPreview)return;
-
-        if (now-lastAnimationPaint < 1000/30) return;
+        let cameraPainted=false;
+        if (cameraDrawPending) {
+          cameraDrawPending=false;
+          if (zoomPreview) drawZoomPreview();
+          else draw(true);
+          cameraPainted=true;
+        }
+        if (zoomPreview) return;
+        if (sceneViewKey!==cameraViewKey()) {
+          draw(true);
+          cameraPainted=true;
+        }
+        if (!cameraPainted && !frameDirty && now-lastAnimationPaint<1000/30) return;
         lastAnimationPaint = now;
         advanceKeyboardPan(now);
         const elapsed = Math.min((now-(lastTrafficTime ?? now))/1000,.05);
         lastTrafficTime = now;
-        const pixelRatio = trafficCanvas.width/width;
+        const pixelRatio = displayPixelRatio;
         trafficContext.setTransform(pixelRatio,0,0,pixelRatio,0,0);
         trafficContext.clearRect(0,0,width,height);
         if (shadowsNeedPaint) paintShadows();
@@ -1154,8 +1261,7 @@
               const y = oy+car.from.y+dy*car.distance+dx*4;
               const [px,py] = project(x,y,2);
               if (px < -20 || px > width+20 || py < -20 || py > height+20) continue;
-              trafficContext.save();
-              clipForeground(x+y, px-28*scale-8, py-18*scale-8, px+28*scale+8, py+18*scale+8, true);
+              drawOccluded(x+y,px-28*scale-8,py-18*scale-8,px+28*scale+8,py+18*scale+8,true,()=> {
               const length = Math.max(16, 8/scale), breadth = Math.max(7, 3/scale);
               const w = dx ? length : breadth, d = dy ? length : breadth;
               const bodyHeight = Math.max(4, 2/scale);
@@ -1168,7 +1274,7 @@
               const lightOffset = length*.42;
               plane(x+dx*lightOffset-1,y+dy*lightOffset-1,2,2,"#fff0b8",bodyHeight);
               plane(x-dx*lightOffset-1,y-dy*lightOffset-1,2,2,"#ed645d",bodyHeight);
-              trafficContext.restore();
+              });
             }
           }
         } finally {
@@ -1176,6 +1282,7 @@
         }
         drawFactorySmoke(now);
         drawPassingPlane(now);
+        presentFrame();
       }
 
       function drawFactorySmoke(now) {
@@ -1593,16 +1700,19 @@
         const list=viewObjects();
         const index=list.findIndex(object=>object.building===selected);
         if(index<0)return null;
-        const ratio=structureCanvas.width/width;
+        const ratio=displayPixelRatio;
         const previousContext=ctx;
         function capture(items) {
           const image=document.createElement("canvas");
           image.width=structureCanvas.width;image.height=structureCanvas.height;
+          const captureContext=image.getContext("2d");
           try {
-            ctx=image.getContext("2d");
+            ctx=captureContext;
+            screenContexts.add(captureContext);
             ctx.setTransform(ratio,0,0,ratio,0,0);
             drawObjectList(items);
           } finally {
+            screenContexts.delete(captureContext);
             ctx=previousContext;
           }
           return image;
@@ -1620,23 +1730,36 @@
         const previousContext=ctx;
         try {
           structureContext.clearRect(0,0,width,height);
-          structureContext.drawImage(liveHeightScene.behind,0,0,width,height);
+          structureContext.drawImage(liveHeightScene.behind,0,0,structureCanvas.width/displayPixelRatio,structureCanvas.height/displayPixelRatio);
           ctx=structureContext;
           drawBuilding(selected);
-          structureContext.drawImage(liveHeightScene.front,0,0,width,height);
+          structureContext.drawImage(liveHeightScene.front,0,0,structureCanvas.width/displayPixelRatio,structureCanvas.height/displayPixelRatio);
         } finally {
           ctx=previousContext;
         }
         liveHeightScene.dynamicGrid=buildOcclusionGrid(null,selected);
+        frameDirty=true;
         shadowsNeedPaint=true;
         paintShadows();
       }
       function scheduleLiveHeightPreview() {
         if(heightPreviewFrame===undefined)heightPreviewFrame=requestAnimationFrame(paintLiveHeightPreview);
       }
-      let dragImage;
-      const dragMargin = 224;
-      function draw() {
+      function cameraViewKey() {
+        return [width,height,scale,camera.x,camera.y].join(",");
+      }
+      function presentFrame() {
+        if (!width || !height || sceneViewKey!==cameraViewKey()) return;
+        presentationContext.setTransform(1,0,0,1,0,0);
+        presentationContext.clearRect(0,0,canvas.width,canvas.height);
+        for (const layer of [groundCanvas,shadowCanvas,structureCanvas,trafficCanvas]) {
+          presentationContext.drawImage(layer,0,0);
+        }
+        const {originX,originY}=screenOrigin();
+        presentedView={width,height,scale,x:(width/2-originX)/scale,y:(height/2-originY)/scale};
+        frameDirty=false;
+      }
+      function draw(cameraOnly=false) {
         clearTimeout(heightScenePrepTimer);
         clearTimeout(heightPreviewTimer);
         cancelAnimationFrame(heightPreviewFrame);
@@ -1646,8 +1769,10 @@
         clearZoomPreview();
         viewQueryCache=null;
         refreshSplitButtons();
-        dragImage = undefined;
-        occlusionGrid = undefined;
+        if (!cameraOnly) {
+          occlusionGrid=undefined;
+          occlusionAnchor=undefined;
+        }
         clearTimeout(colorPreviewTimer);
         renderMap();
         queueWorldPreview();
@@ -1684,6 +1809,10 @@
         drawMergeSelection();
         if (swapSource) drawSwapHighlights();
         if (districtMode) drawTargets();
+        if (ctx===groundContext2D) {
+          sceneViewKey=cameraViewKey();
+          frameDirty=true;
+        }
       }
       function intersectsView(x,y,w,d,h=0,margin=0) {
         const [left] = project(x,y+d);
@@ -1940,6 +2069,7 @@
         if(!force && view===lastShadowView && now-lastShadowPaint<150)return;
         lastShadowView=view;
         lastShadowPaint=now;
+        frameDirty=true;
         shadowsNeedPaint=false;
         shadowContext.clearRect(0,0,width,height);
         const sun=solarState(timeSettings.minute);
@@ -2071,8 +2201,8 @@
           try {
             ctx=image.getContext("2d");
             width=iw;height=ih;
-            camera.x=previous.x+(left+(iw-previous.width)/2)/scale;
-            camera.y=previous.y+(top+(ih-previous.height)/2)/scale;
+            camera.x=(left-originX+iw/2)/scale;
+            camera.y=(top-originY+ih/2)/scale;
             drawObjectList(list);
           } finally {
             ({ctx,width,height}=previous);
@@ -2128,8 +2258,15 @@
         ({width,height} = canvas.getBoundingClientRect());
         if (!width || !height) return;
         const ratio = Math.min(window.devicePixelRatio || 1,2);
+        displayPixelRatio=ratio;
+        sharedProjection=undefined;
         canvas.width = Math.round(width*ratio);
         canvas.height = Math.round(height*ratio);
+        groundCanvas.width=canvas.width;
+        groundCanvas.height=canvas.height;
+        presentedView=null;
+        sceneViewKey="";
+        frameDirty=true;
         trafficCanvas.width = canvas.width;
         trafficCanvas.height = canvas.height;
         shadowCanvas.width=structureCanvas.width=mergeCanvas.width=canvas.width;
@@ -2159,32 +2296,7 @@
         camera.x = Math.max(city.left,Math.min(city.right,camera.x-dx/scale));
         camera.y = Math.max(city.top,Math.min(city.bottom,camera.y-dy/scale));
         if (dragging) scheduleCameraDraw();
-        else draw();
-      }
-      function drawDragFrame() {
-        if (!width || !height || !scale) return;
-        if (!dragImage || dragImage.scale !== scale ||
-            Math.abs(dragImage.x-camera.x)*scale >= dragMargin ||
-            Math.abs(dragImage.y-camera.y)*scale >= dragMargin) {
-          const image = dragImage?.image ?? document.createElement("canvas");
-          const previous = {ctx,width,height};
-          const ratio = canvas.width/width;
-          width += dragMargin*2;
-          height += dragMargin*2;
-          image.width = Math.ceil(width*ratio);
-          image.height = Math.ceil(height*ratio);
-          try {
-            ctx = image.getContext("2d");
-            ctx.setTransform(ratio,0,0,ratio,0,0);
-            renderMap();
-          } finally {
-            ({ctx,width,height} = previous);
-          }
-          dragImage = {image,x:camera.x,y:camera.y,scale,ratio};
-        }
-        const {image,x,y,ratio} = dragImage;
-        ctx.drawImage(image,(x-camera.x)*scale-dragMargin,
-          (y-camera.y)*scale-dragMargin,image.width/ratio,image.height/ratio);
+        else draw(true);
       }
       function scheduleWorldPreviewSlice() {
         worldPreviewTimer=setTimeout(paintWorldPreviewSlice,16);
@@ -2199,9 +2311,11 @@
           const ratio=Math.min(1,1200/width,1000/height);
           image.width=Math.ceil(width*ratio);image.height=Math.ceil(height*ratio);
           const context=image.getContext("2d");
-          context.drawImage(canvas,0,0,image.width,image.height);
+          context.drawImage(groundCanvas,0,0,image.width,image.height);
           context.drawImage(structureCanvas,0,0,image.width,image.height);
-          worldPreview={version:worldPreviewVersion,image,width,height,scale,x:camera.x,y:camera.y};
+          const {originX,originY}=screenOrigin();
+          worldPreview={version:worldPreviewVersion,image,width,height,scale,
+            x:(width/2-originX)/scale,y:(height/2-originY)/scale};
           return;
         }
         if(worldPreviewJob?.version===worldPreviewVersion)return;
@@ -2262,8 +2376,9 @@
       function drawWorldPreview(context) {
         if(!worldPreview || worldPreview.version!==worldPreviewVersion)return;
         const factor=scale/worldPreview.scale;
-        const left=width/2-worldPreview.width*factor/2+(worldPreview.x-camera.x)*scale;
-        const top=height/2-worldPreview.height*factor/2+(worldPreview.y-camera.y)*scale;
+        const origin=screenOrigin();
+        const left=origin.originX-worldPreview.width*factor/2+worldPreview.x*scale;
+        const top=origin.originY-worldPreview.height*factor/2+worldPreview.y*scale;
         context.drawImage(worldPreview.image,left,top,worldPreview.width*factor,worldPreview.height*factor);
       }
 
@@ -2271,29 +2386,33 @@
       let zoomSettleTimer;
       function clearZoomPreview() {
         clearTimeout(zoomSettleTimer);
+        if (zoomPreview) {
+          frameDirty=true;
+          sceneViewKey="";
+        }
         zoomPreview=undefined;
       }
       function beginZoomPreview() {
-        if(zoomPreview)return;
-        const layers=[canvas,shadowCanvas,structureCanvas,trafficCanvas].map(source=>{
-          const image=document.createElement("canvas");
-          image.width=source.width;image.height=source.height;
-          image.getContext("2d").drawImage(source,0,0);
-          return {target:source,image};
-        });
-        zoomPreview={layers,scale,x:camera.x,y:camera.y,width,height};
+        if (zoomPreview || !presentedView) return;
+        const image=document.createElement("canvas");
+        image.width=canvas.width;image.height=canvas.height;
+        image.getContext("2d").drawImage(canvas,0,0);
+        zoomPreview={image,...presentedView};
       }
       function drawZoomPreview() {
-        if(!zoomPreview)return;
+        if (!zoomPreview) return;
         const factor=scale/zoomPreview.scale;
-        const left=width/2*(1-factor)+(zoomPreview.x-camera.x)*scale;
-        const top=height/2*(1-factor)+(zoomPreview.y-camera.y)*scale;
-        for(const {target,image} of zoomPreview.layers) {
-          const context=target.getContext("2d");
-          context.clearRect(0,0,width,height);
-          if(target===canvas)drawWorldPreview(context);
-          context.drawImage(image,left,top,zoomPreview.width*factor,zoomPreview.height*factor);
-        }
+        const rawLeft=width/2-zoomPreview.width*factor/2+(zoomPreview.x-camera.x)*scale;
+        const rawTop=height/2-zoomPreview.height*factor/2+(zoomPreview.y-camera.y)*scale;
+        const left=displayPixel(rawLeft),top=displayPixel(rawTop);
+        const ratio=displayPixelRatio;
+        presentationContext.setTransform(ratio,0,0,ratio,0,0);
+        presentationContext.clearRect(0,0,width,height);
+        drawWorldPreview(presentationContext);
+        presentationContext.drawImage(zoomPreview.image,left,top,
+          zoomPreview.width*factor,zoomPreview.height*factor);
+        presentedView={width,height,scale,
+          x:camera.x-(left-rawLeft)/scale,y:camera.y-(top-rawTop)/scale};
         drawMergeSelection();
       }
       function settleZoom() {
@@ -2305,17 +2424,9 @@
       }
       let cameraDrawPending = false;
       function scheduleCameraDraw() {
-        if (cameraDrawPending) return;
-        cameraDrawPending = true;
-        requestAnimationFrame(() => {
-          cameraDrawPending = false;
-          if (!root.isConnected) return;
-          if(zoomPreview)drawZoomPreview();
-          else draw();
-        });
+        cameraDrawPending=true;
       }
       function finishMapDrag() {
-        dragImage = undefined;
         scheduleCameraDraw();
       }
       function changeZoom(factor, x=width/2, y=height/2, interactive=false) {

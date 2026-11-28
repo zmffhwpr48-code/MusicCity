@@ -143,6 +143,7 @@
       if (selected && focus) tab.focus();
     }
     document.querySelector(".playlist-content").scrollTop = 0;
+    refreshBuildingControls();
   }
   let selectedBuildingId = null;
   let activeAudioURL = null;
@@ -159,14 +160,61 @@
       .filter(name => typeof name === "string" && name.trim());
   }
 
+  function genreLabel(track) {
+    return track.genre || "장르 선택되지 않음";
+  }
+
+  async function deleteCustomGenre(name) {
+    if (saving || !(library.genres ?? []).includes(name)) return;
+    const changed = tracks.filter(track => track.genre === name).map(track => ({ ...track, genre: "" }));
+    if (!confirm(`「${name}」 장르를 삭제할까요?\n${changed.length}곡의 장르가 ‘장르 선택되지 않음’으로 바뀝니다.`)) return;
+    const next = structuredClone(library);
+    next.genres = next.genres.filter(genre => genre !== name);
+    saving = true;
+    renderTracks();
+    try {
+      await writeRecords(changed, null, null, next);
+      library = next;
+      const byId = new Map(changed.map(track => [track.id, track]));
+      tracks = tracks.map(track => byId.get(track.id) ?? track);
+      notify(`「${name}」 장르를 삭제했어요. ${changed.length}곡을 ‘장르 선택되지 않음’으로 변경했어요.`);
+      return true;
+    } catch (error) {
+      const message = "장르를 삭제하지 못했어요. 다시 시도해 주세요.";
+      notify(message, true);
+      if ($("#edit-track-dialog").open) $("#edit-track-feedback").textContent = message;
+      return false;
+    } finally {
+      saving = false;
+      renderTracks();
+    }
+  }
+
+  function positionGenreMenu(select) {
+    const menu = $(`#${select.id}-menu`);
+    if (!menu.matches(":popover-open")) return;
+    const rect = $(`#${select.id}-trigger`).getBoundingClientRect();
+    const width = Math.min(rect.width, window.innerWidth - 16);
+    menu.style.width = `${width}px`;
+    menu.style.left = `${Math.max(8, Math.min(rect.left, window.innerWidth - width - 8))}px`;
+    const below = window.innerHeight - rect.bottom - 12;
+    const above = rect.top - 12;
+    const opensBelow = below >= Math.min(280, menu.scrollHeight) || below >= above;
+    menu.style.maxHeight = `${Math.max(40, Math.min(280, opensBelow ? below : above))}px`;
+    const height = menu.getBoundingClientRect().height;
+    menu.style.top = `${opensBelow ? rect.bottom + 4 : Math.max(8, rect.top - height - 4)}px`;
+  }
+
   function refreshGenreOptions() {
     const names = genreNames();
     for (const select of [$("#track-genre"), $("#edit-track-genre")]) {
-      const value = select.value;
+      const value = names.includes(select.value) ? select.value : "";
+      const unassigned = select.id === "edit-track-genre";
+      const placeholderText = unassigned ? "장르 선택되지 않음" : "장르 선택";
       const placeholder = document.createElement("option");
       placeholder.value = "";
-      placeholder.textContent = "장르 선택";
-      placeholder.disabled = true;
+      placeholder.textContent = placeholderText;
+      placeholder.disabled = !unassigned;
       placeholder.defaultSelected = true;
       const options = names.map(name => {
         const option = document.createElement("option");
@@ -174,24 +222,53 @@
         option.textContent = name;
         return option;
       });
-      const add = document.createElement("option");
-      add.value = "";
-      add.dataset.addGenre = "true";
-      add.textContent = "＋ 장르 직접 추가";
-      select.replaceChildren(placeholder, ...options, add);
-      select.value = names.includes(value) ? value : "";
-      select.dataset.genreValue = select.value;
+      select.replaceChildren(placeholder, ...options);
+      select.value = value;
       select.disabled = saving;
+      const trigger = $(`#${select.id}-trigger`);
+      trigger.disabled = saving;
+      $(`#${select.id}-value`).textContent = value || placeholderText;
+      const menu = $(`#${select.id}-menu`);
+      const rows = (unassigned ? ["", ...names] : names).map(name => {
+        const row = document.createElement("div");
+        row.className = "genre-option";
+        row.classList.toggle("is-current", name === value);
+        const choice = button(name || placeholderText, "choose-genre", saving);
+        choice.className = "genre-choice";
+        choice.title = name || placeholderText;
+        choice.setAttribute("aria-pressed", String(name === value));
+        choice.addEventListener("click", () => {
+          select.value = name;
+          menu.hidePopover();
+          refreshGenreOptions();
+          trigger.focus();
+        });
+        row.append(choice);
+        if ((library.genres ?? []).includes(name)) {
+          const remove = button("🗑", "delete-genre", saving);
+          remove.className = "genre-remove";
+          remove.title = `「${name}」 장르 삭제`;
+          remove.setAttribute("aria-label", remove.title);
+          remove.addEventListener("click", async () => {
+            if (await deleteCustomGenre(name)) menu.querySelector(".genre-choice")?.focus();
+          });
+          row.append(remove);
+        }
+        return row;
+      });
+      const add = button("＋ 장르 직접 추가", "add-genre", saving);
+      add.className = "genre-choice genre-add";
+      add.addEventListener("click", async () => {
+        menu.hidePopover();
+        await addCustomGenre(select);
+        trigger.focus();
+      });
+      menu.replaceChildren(...rows, add);
+      positionGenreMenu(select);
     }
   }
 
-  async function selectGenre(event) {
-    const select = event.target;
-    if (select.selectedOptions[0]?.dataset.addGenre !== "true") {
-      select.dataset.genreValue = select.value;
-      return;
-    }
-    select.value = select.dataset.genreValue ?? "";
+  async function addCustomGenre(select) {
     if (saving) return;
     const name = prompt("추가할 장르 이름을 입력해 주세요.")?.trim();
     if (!name) return;
@@ -210,8 +287,30 @@
       selectedName = name;
     }
     select.value = selectedName;
-    select.dataset.genreValue = selectedName;
+    refreshGenreOptions();
     if (select.id === "edit-track-genre") $("#edit-track-feedback").textContent = "";
+  }
+
+  function initializeGenreMenus() {
+    for (const select of [$("#track-genre"), $("#edit-track-genre")]) {
+      const trigger = $(`#${select.id}-trigger`);
+      const menu = $(`#${select.id}-menu`);
+      menu.addEventListener("toggle", event => {
+        trigger.setAttribute("aria-expanded", String(event.newState === "open"));
+        positionGenreMenu(select);
+      });
+      new ResizeObserver(() => positionGenreMenu(select)).observe(trigger);
+    }
+    window.addEventListener("resize", () => {
+      positionGenreMenu($("#track-genre"));
+      positionGenreMenu($("#edit-track-genre"));
+    });
+    document.querySelector(".playlist-content").addEventListener("scroll", () => {
+      for (const select of [$("#track-genre"), $("#edit-track-genre")]) {
+        const menu = $(`#${select.id}-menu`);
+        if (menu.matches(":popover-open")) menu.hidePopover();
+      }
+    });
   }
 
   function currentPlaylist() {
@@ -220,6 +319,19 @@
 
   function playlistForBuilding(id) {
     return library.playlists.find(item => item.id === library.links[id]) ?? null;
+  }
+
+  function connectPlaylist(links, buildingId, playlistId) {
+    const affected = [buildingId, ...Object.keys(links).filter(id => links[id] === playlistId)];
+    for (const id of affected) delete links[id];
+    links[buildingId] = playlistId;
+    return affected;
+  }
+
+  function uniquePlaylistLinks(links) {
+    const lastBuilding = new Map();
+    for (const [buildingId, playlistId] of Object.entries(links)) lastBuilding.set(playlistId, buildingId);
+    return Object.fromEntries(Object.entries(links).filter(([buildingId, playlistId]) => lastBuilding.get(playlistId) === buildingId));
   }
 
   function button(label, action, disabled = false) {
@@ -631,11 +743,12 @@
   }
 
   function refreshPlayer() {
+    document.querySelector(".player-panel").hidden = !audio.dataset.trackId || !audio.hasAttribute("src");
     map.setSelectedTrack?.(selectedTrackId);
     const track = currentTrack();
     $("#now-track").textContent = track?.title ?? "재생할 곡을 선택해 주세요";
     $("#now-artist").textContent = track
-      ? `${track.artist} · ${track.genre}${track.hasAudio ? "" : " · 음원 없음"}`
+      ? `${track.artist} · ${genreLabel(track)}${track.hasAudio ? "" : " · 음원 없음"}`
       : "직접 추가한 음원을 여기서 재생할 수 있어요";
 
     const playable = Boolean(track?.hasAudio || (!track && currentPlaylist()?.trackIds.some(id => tracks.some(item => item.id === id && item.hasAudio))));
@@ -653,6 +766,8 @@
   }
 
   function refreshBuildingControls() {
+    linkButton.hidden = activePlaylistTab !== "library";
+    $("#link-playlist").hidden = activePlaylistTab !== "playlists";
     const linked = selectedBuildingId ? linkedTo(selectedBuildingId) : null;
     const linkedPlaylist = selectedBuildingId ? playlistForBuilding(selectedBuildingId) : null;
     const track = currentTrack();
@@ -727,7 +842,7 @@
       }
       item.querySelector(".track-name").textContent = track.title;
       item.querySelector(".track-meta").textContent =
-        `${track.artist} · ${track.genre}${track.buildingId ? " · 🏙 연결됨" : ""}${track.hasAudio ? "" : " · 음원 없음"}`;
+        `${track.artist} · ${genreLabel(track)}${track.buildingId ? " · 🏙 연결됨" : ""}${track.hasAudio ? "" : " · 음원 없음"}`;
       item.querySelector(".track-number").textContent = String(index + 1).padStart(2, "0");
       const actions = document.createElement("div");
       actions.className = "track-library-actions";
@@ -870,11 +985,11 @@
     const nextLibrary = structuredClone(library);
     delete nextLibrary.links[buildingId];
     const playlist = library.playlists.find(item => trackIds.includes(`playlist:${item.id}`));
-    if (playlist) nextLibrary.links[buildingId] = playlist.id;
+    const affectedPlaylistBuildings = playlist ? connectPlaylist(nextLibrary.links, buildingId, playlist.id) : [];
     const wanted=new Set(trackIds.filter(id => tracks.some(track => track.id === id)));
     const affected=tracks.filter(track=>track.buildingId===buildingId || wanted.has(track.id));
     const changed=affected.map(track=>({...track,buildingId:wanted.has(track.id)?buildingId:null}));
-    const affectedBuildings=[buildingId,...affected.map(track=>track.buildingId).filter(Boolean)];
+    const affectedBuildings=[buildingId,...affectedPlaylistBuildings,...affected.map(track=>track.buildingId).filter(Boolean)];
     saving=true;
     refreshBuildingControls();
     try {
@@ -900,7 +1015,7 @@
     const buildingId = selectedBuildingId;
     if (!playlist || !buildingId || saving || !map.getBuilding?.(buildingId)) return;
     const next = structuredClone(library);
-    next.links[buildingId] = playlist.id;
+    const affectedBuildings = connectPlaylist(next.links, buildingId, playlist.id);
     const changed = tracks.filter(track => track.buildingId === buildingId).map(track => ({ ...track, buildingId: null }));
     saving = true;
     renderTracks();
@@ -909,8 +1024,8 @@
       library = next;
       const changedIds = new Set(changed.map(track => track.id));
       tracks = tracks.map(track => changedIds.has(track.id) ? { ...track, buildingId: null } : track);
-      syncBuildings([buildingId]);
-      notify(`「${playlist.name}」 플레이리스트를 건물에 연결했어요.`);
+      syncBuildings(affectedBuildings);
+      notify(`「${playlist.name}」 플레이리스트를 이 건물에 연결했어요.`);
     } catch (error) {
       notify(`플레이리스트 연결 실패: ${error?.message}`, true);
     } finally {
@@ -1001,15 +1116,8 @@
     $("#edit-track-title").value = track.title;
     $("#edit-track-artist").value = track.artist;
     const genre = $("#edit-track-genre");
-    genre.replaceChildren(...Array.from($("#track-genre").options, option => option.cloneNode(true)));
-    if (!Array.from(genre.options).some(option => option.value === track.genre)) {
-      const option = document.createElement("option");
-      option.value = track.genre;
-      option.textContent = track.genre;
-      genre.append(option);
-    }
-    genre.value = track.genre;
-    genre.dataset.genreValue = track.genre;
+    genre.value = track.genre ?? "";
+    refreshGenreOptions();
     $("#edit-track-feedback").textContent = "";
     dialog.showModal();
   }
@@ -1030,8 +1138,8 @@
     const title = $("#edit-track-title").value.trim();
     const artist = $("#edit-track-artist").value.trim();
     const genre = $("#edit-track-genre").value;
-    if (!title || !artist || !genre) {
-      feedback.textContent = "곡 제목, 아티스트, 장르를 모두 입력해 주세요.";
+    if (!title || !artist) {
+      feedback.textContent = "곡 제목과 아티스트를 입력해 주세요.";
       return;
     }
     const changed = { ...track, title, artist, genre };
@@ -1135,11 +1243,18 @@
       database = await openDatabase();
       tracks = await getAllTracks();
       library = await getLibrary();
+      const previousBuildingIds = Object.keys(library.links);
+      const uniqueLinks = uniquePlaylistLinks(library.links);
+      if (Object.keys(uniqueLinks).length !== previousBuildingIds.length) {
+        const next = { ...library, links: uniqueLinks };
+        await writeRecords([], null, null, next);
+        library = next;
+      }
       if (!currentPlaylist()) library.selectedPlaylistId = library.playlists[0]?.id ?? null;
       tracks.sort((a, b) => a.createdAt - b.createdAt);
       map.getBuildingTrackAssignments=getBuildingTrackAssignments;
       map.setBuildingTrackAssignments=setBuildingTrackAssignments;
-      syncBuildings();
+      syncBuildings([...previousBuildingIds, ...tracks.map(track => track.buildingId).filter(Boolean)]);
       renderTracks();
       notify(`${tracks.length}곡을 불러왔어요. 곡을 선택해 재생하거나 건물에 배정할 수 있어요.`);
     } catch (error) {
@@ -1150,8 +1265,7 @@
     }
 
     form.addEventListener("submit", addTrack);
-    $("#track-genre").addEventListener("change", selectGenre);
-    $("#edit-track-genre").addEventListener("change", selectGenre);
+    initializeGenreMenus();
     document.querySelector(".playlist-tabs").addEventListener("click", event => {
       const tab = event.target.closest('[role="tab"]');
       if (tab) setPlaylistTab(tab.dataset.view);
